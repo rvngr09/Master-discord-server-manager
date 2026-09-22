@@ -4,12 +4,13 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, timezone
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from students import load_students
 
@@ -17,6 +18,7 @@ BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 VERIFIED_PATH = BASE_DIR / "verified.json"
 VERIFY_LOG_PATH = BASE_DIR / "verify_log.csv"
+REMINDERS_PATH = BASE_DIR / "reminders.json"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,12 +35,27 @@ ETAT_LABELS = {
 }
 
 # ---- anti-spam / timeout settings ----
-MAX_STRIKES = 3                # 3 non-numeric messages ...
-STRIKE_WINDOW_SECONDS = 60     # ... within 60s counts
-TIMEOUT_SECONDS = 5 * 60       # ... then ignore for 5 min
+MAX_STRIKES = 3
+STRIKE_WINDOW_SECONDS = 60
+TIMEOUT_SECONDS = 5 * 60
+
+# ---- reminders ----
+MAX_REMINDERS_PER_USER = 20
+REMINDER_MAX_DAYS_AHEAD = 365
 
 
 # ---------------- helpers ----------------
+
+def _get_channel_id(config: dict, key: str):
+    value = config.get(key)
+    if not value:
+        return None
+    try:
+        cid = int(value)
+        return cid if cid > 0 else None
+    except (TypeError, ValueError):
+        return None
+
 
 def _is_admin(bot, user) -> bool:
     admin_ids = bot.config.get("admin_user_ids", [])
@@ -76,13 +93,34 @@ def save_verified(data: dict):
         log.warning("Could not write verified.json: %s", exc)
 
 
+def load_config_file() -> dict:
+    with open(CONFIG_PATH) as f:
+        return json.load(f)
+
+
+def load_reminders() -> list:
+    if REMINDERS_PATH.exists():
+        try:
+            with open(REMINDERS_PATH) as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return data
+        except Exception as exc:
+            log.warning("Could not read reminders.json: %s", exc)
+    return []
+
+
+def save_reminders(data: list):
+    try:
+        with open(REMINDERS_PATH, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as exc:
+        log.warning("Could not write reminders.json: %s", exc)
+
+
 def log_verification(user_id: int, username: str, display_name: str, matricule: str,
                      full_name: str = "", section: str = "", td: str = "", tp: str = "",
                      status: str = "OK"):
-    """
-    Append a row to verify_log.csv. Creates the file with a header on first write.
-    Status is one of: OK, NOT_IN_LIST, WRONG_SPECIALITY, NOT_ADMIS, ALREADY_VERIFIED.
-    """
     file_exists = VERIFY_LOG_PATH.exists()
     try:
         with open(VERIFY_LOG_PATH, "a", newline="", encoding="utf-8") as f:
@@ -102,12 +140,40 @@ def log_verification(user_id: int, username: str, display_name: str, matricule: 
         log.warning("Could not write verify_log.csv: %s", exc)
 
 
-def _all_td_groups(students: dict) -> list[str]:
+def _all_td_groups(students: dict) -> list:
     td = set()
     for s in students.values():
         if s.is_sii and s.groupe_td:
             td.add(s.groupe_td)
     return sorted(td, key=lambda x: (len(x), x))
+
+
+def _parse_reminder_date(text: str):
+    """
+    Accept:
+      - ISO 8601: 2026-09-25T14:30 or 2026-09-25 14:30
+      - DD/MM/YYYY HH:MM
+      - YYYY-MM-DD HH:MM
+    Returns a timezone-aware UTC datetime, or None if invalid.
+    """
+    text = text.strip()
+    formats = [
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M",
+        "%d/%m/%Y %H:%M",
+        "%d/%m/%Y",
+        "%Y-%m-%d",
+    ]
+    # Assume server runs in UTC (adjust if you prefer another TZ)
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(text, fmt)
+            if fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+                dt = dt.replace(hour=9, minute=0)  # default 9 AM UTC
+            return dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
 
 
 async def _apply_role(interaction: discord.Interaction, role_name: str) -> bool:
@@ -128,7 +194,7 @@ async def _apply_role(interaction: discord.Interaction, role_name: str) -> bool:
         return False
 
 
-async def _set_td_group_role(bot, member: discord.Member, td_group: str) -> str | None:
+async def _set_td_group_role(bot, member: discord.Member, td_group: str):
     if not td_group:
         return None
 
@@ -162,9 +228,10 @@ async def _set_td_group_role(bot, member: discord.Member, td_group: str) -> str 
         return None
 
 
-async def _notify_mods(bot, interaction: discord.Interaction, matricule: str, student, reason: str, success: bool = False):
-    channel_id = bot.config.get("mod_channel_id")
-    if not channel_id:
+async def _notify_mods(bot, interaction: discord.Interaction, matricule: str, student,
+                       reason: str, success: bool = False):
+    channel_id = _get_channel_id(bot.config, "mod_channel_id")
+    if channel_id is None:
         return
     channel = interaction.guild.get_channel(channel_id)
     if channel is None:
@@ -194,18 +261,20 @@ class VerifyBot(commands.Bot):
         self.config = config
         self.students: dict = {}
         self.skipped_rows = 0
-        self.verified: dict = load_verified()          # {discord_id_str: matricule}
-        self.matricule_to_user: dict = {                # {matricule: discord_id_str}
+        self.verified: dict = load_verified()
+        self.matricule_to_user: dict = {
             mat: uid for uid, mat in self.verified.items()
         }
-        # anti-spam state per user: {user_id: {"strikes": [ts, ...], "until": ts}}
         self.spam_state: dict = {}
+        self.reminders: list = load_reminders()
         self.reload_students()
         self._register_commands()
 
     # ---------- lifecycle ----------
 
     async def setup_hook(self):
+        self.reminder_loop.start()
+
         guild_id = self.config.get("sync_guild_id")
         if not guild_id:
             log.warning("sync_guild_id not set — commands will sync globally (slow).")
@@ -222,10 +291,7 @@ class VerifyBot(commands.Bot):
             synced = await self.tree.sync(guild=guild_obj)
             if not synced:
                 log.error(
-                    "Synced 0 commands to guild %s. This usually means the bot lacks "
-                    "the 'applications.commands' OAuth scope. Re-invite with the URL "
-                    "from Developer Portal -> OAuth2 -> URL Generator, checking BOTH "
-                    "'bot' and 'applications.commands'.",
+                    "Synced 0 commands to guild %s. Bot likely lacks 'applications.commands' scope.",
                     guild_id,
                 )
             else:
@@ -245,6 +311,56 @@ class VerifyBot(commands.Bot):
                  [(g.name, g.id) for g in self.guilds])
         await self._send_startup_message()
 
+    # ---------- reminder background task ----------
+
+    @tasks.loop(seconds=30)
+    async def reminder_loop(self):
+        """Check for due reminders and DM users."""
+        if not self.reminders:
+            return
+        now = datetime.now(timezone.utc)
+        due = []
+        keep = []
+        for r in self.reminders:
+            try:
+                when = datetime.fromisoformat(r["when"])
+            except Exception:
+                continue
+            if when <= now:
+                due.append(r)
+            else:
+                keep.append(r)
+
+        if not due:
+            return
+
+        log.info("Firing %d reminder(s)", len(due))
+        for r in due:
+            try:
+                user = self.get_user(int(r["user_id"])) or await self.fetch_user(int(r["user_id"]))
+                if user is None:
+                    log.warning("Reminder: user %s not found", r["user_id"])
+                    continue
+                embed = discord.Embed(
+                    title="⏰ Reminder",
+                    description=r["message"],
+                    color=discord.Color.blurple(),
+                    timestamp=now,
+                )
+                embed.set_footer(text=f"Scheduled for {r['when']} UTC")
+                await user.send(embed=embed)
+            except discord.Forbidden:
+                log.warning("Reminder: cannot DM user %s", r.get("user_id"))
+            except discord.HTTPException as exc:
+                log.warning("Reminder send failed: %s", exc)
+
+        self.reminders = keep
+        save_reminders(self.reminders)
+
+    @reminder_loop.before_loop
+    async def before_reminder_loop(self):
+        await self.wait_until_ready()
+
     # ---------- message / interaction logging ----------
 
     async def on_message(self, message: discord.Message):
@@ -254,51 +370,73 @@ class VerifyBot(commands.Bot):
             log.info("[DM] <%s>: %s", message.author, message.content)
             return
 
-        # Anti-spam: only monitor the verify channel if configured
-        verify_channel_id = self.config.get("verify_channel_id")
-        if verify_channel_id and message.channel.id == int(verify_channel_id):
+        verify_channel_id = _get_channel_id(self.config, "verify_channel_id")
+        if verify_channel_id and message.channel.id == verify_channel_id:
             now = time.monotonic()
             state = self.spam_state.setdefault(
                 message.author.id,
                 {"strikes": [], "until": 0.0},
             )
 
-            # If user is currently timed out, silently ignore
             if state["until"] > now:
-                log.info("Ignored message from %s (timeout active for %.0fs)",
-                         message.author, state["until"] - now)
+                log.info("Muted user %s posted in verify channel — deleting", message.author)
+                try:
+                    await message.delete()
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
                 return
 
             content = message.content.strip()
             if not content.isdigit():
-                # count as a strike
-                state["strikes"] = [t for t in state["strikes"] if now - t < STRIKE_WINDOW_SECONDS]
+                state["strikes"] = [
+                    t for t in state["strikes"] if now - t < STRIKE_WINDOW_SECONDS
+                ]
                 state["strikes"].append(now)
-                remaining = MAX_STRIKES - len(state["strikes"])
-                log.info("Strike %d/%d for %s", len(state["strikes"]), MAX_STRIKES, message.author)
+                count = len(state["strikes"])
+                log.info("Strike %d/%d for %s in verify channel", count, MAX_STRIKES, message.author)
 
-                if len(state["strikes"]) >= MAX_STRIKES:
+                try:
+                    await message.delete()
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+
+                if count >= MAX_STRIKES:
                     state["until"] = now + TIMEOUT_SECONDS
                     state["strikes"] = []
-                    log.warning("Muted %s for %ds (too many non-numeric messages)",
-                                message.author, TIMEOUT_SECONDS)
+
+                    if isinstance(message.author, discord.Member):
+                        try:
+                            until = datetime.now(timezone.utc) + timedelta(seconds=TIMEOUT_SECONDS)
+                            await message.author.timeout(
+                                until,
+                                reason="Too many non-numeric messages in verify channel",
+                            )
+                            log.warning("Discord-timeout applied to %s for %ds",
+                                        message.author, TIMEOUT_SECONDS)
+                        except discord.Forbidden:
+                            log.warning("Could not timeout %s — missing Moderate Members perm "
+                                        "or role hierarchy issue", message.author)
+                        except discord.HTTPException as exc:
+                            log.warning("timeout() failed for %s: %s", message.author, exc)
+
                     try:
                         await message.channel.send(
-                            f"{message.author.mention} you've sent too many non-numeric messages. "
-                            f"I'll ignore you for **{TIMEOUT_SECONDS // 60} minutes**. "
-                            "Please wait before trying again."
+                            f"{message.author.mention} you've been timed out for "
+                            f"**{TIMEOUT_SECONDS // 60} minutes** — please send only your "
+                            "matricule (a number)."
                         )
                     except discord.HTTPException:
                         pass
-                elif remaining == 1:
+                elif count == MAX_STRIKES - 1:
                     try:
                         await message.channel.send(
                             f"{message.author.mention} please send only your matricule (a number). "
-                            "One more non-numeric message and you'll be muted for 5 minutes."
+                            f"One more non-numeric message and you'll be timed out for "
+                            f"{TIMEOUT_SECONDS // 60} minutes."
                         )
                     except discord.HTTPException:
                         pass
-                return  # don't log strikes as normal content
+                return
 
         extra = f" · {len(message.attachments)} attachment(s)" if message.attachments else ""
         log.info("[%s] #%s <%s>: %s%s",
@@ -337,7 +475,11 @@ class VerifyBot(commands.Bot):
             return
         sent = 0
         for channel_id in channel_ids:
-            channel = self.get_channel(channel_id)
+            try:
+                cid = int(channel_id)
+            except (TypeError, ValueError):
+                continue
+            channel = self.get_channel(cid)
             if channel is None:
                 log.warning("Startup channel %s not found", channel_id)
                 continue
@@ -382,6 +524,23 @@ class VerifyBot(commands.Bot):
                 await interaction.response.send_message("Please run this in a server channel.", ephemeral=True)
                 return
 
+            verify_channel_id = _get_channel_id(self.config, "verify_channel_id")
+            if verify_channel_id is None:
+                await interaction.response.send_message(
+                    "Verification channel is not configured. Contact an admin.", ephemeral=True
+                )
+                return
+            if interaction.channel.id != verify_channel_id:
+                await interaction.response.send_message(
+                    f"❌ Please use `/verify` in <#{verify_channel_id}> only.",
+                    ephemeral=True,
+                )
+                log.info(
+                    "Blocked /verify from %s in #%s (correct channel: %s)",
+                    interaction.user, interaction.channel.name, verify_channel_id,
+                )
+                return
+
             uid = interaction.user.id
             uname = str(interaction.user)
             dname = getattr(interaction.user, "display_name", str(interaction.user))
@@ -394,7 +553,6 @@ class VerifyBot(commands.Bot):
                 )
                 return
 
-            # ---- duplicate check ----
             existing_owner_id = self._find_user_for_matricule(mat)
             if existing_owner_id is not None and existing_owner_id != str(uid):
                 owner_mention = f"<@{existing_owner_id}>"
@@ -409,7 +567,6 @@ class VerifyBot(commands.Bot):
                     "If this is a mistake, contact a moderator so they can unlink it with `/unverify`.",
                     ephemeral=True,
                 )
-                # notify mods too
                 await _notify_mods(
                     self, interaction, mat, None,
                     f"duplicate attempt (owner: <@{existing_owner_id}>)",
@@ -472,7 +629,6 @@ class VerifyBot(commands.Bot):
             if isinstance(interaction.user, discord.Member) and student.groupe_td:
                 group_role_assigned = await _set_td_group_role(self, interaction.user, student.groupe_td)
 
-            # persist + update reverse index
             self.verified[str(uid)] = mat
             self.matricule_to_user[mat] = str(uid)
             save_verified(self.verified)
@@ -608,14 +764,14 @@ class VerifyBot(commands.Bot):
                 header += " (showing first 40)"
             await interaction.response.send_message(header + "\n" + "\n".join(lines), ephemeral=True)
 
-        # --------- /groupe ---------
+        # --------- /groupe (admin-only) ---------
 
-        @self.tree.command(name="groupe", description="List all students in a specific TD group")
+        @self.tree.command(name="groupe", description="List ALL students in a specific TD group (admin only)")
         @app_commands.describe(numero="TD group number (e.g. 1)")
         async def groupe(interaction: discord.Interaction, numero: str):
-            if not _is_verified_member(self, interaction.user) and not _is_admin(self, interaction.user):
+            if not _is_admin(self, interaction.user):
                 await interaction.response.send_message(
-                    "You must be verified to use this command. Run `/verify` first.",
+                    "❌ This command is restricted to admins. Use `/mes_camarades` instead.",
                     ephemeral=True,
                 )
                 return
@@ -633,10 +789,10 @@ class VerifyBot(commands.Bot):
                 )
                 return
 
-            lines = [f"`{s.matricule}` — {s.full_name} (Section {s.section})" for s in matches[:50]]
+            lines = [f"`{s.matricule}` — {s.full_name} (Section {s.section})" for s in matches[:80]]
             header = f"👥 **TD {num}** — {len(matches)} student(s)"
-            if len(matches) > 50:
-                header += " (showing first 50)"
+            if len(matches) > 80:
+                header += " (showing first 80)"
             await interaction.response.send_message(header + "\n" + "\n".join(lines), ephemeral=True)
 
         # --------- /annuaire ---------
@@ -687,6 +843,342 @@ class VerifyBot(commands.Bot):
                 return
             await interaction.response.send_message(text, ephemeral=True)
 
+        # --------- /rappel ---------
+
+        @self.tree.command(name="rappel", description="Set a personal reminder — the bot will DM you at that time")
+        @app_commands.describe(
+            date="When to remind you (e.g. `2026-09-25 14:30`, `25/09/2026 14:30`, or `2026-09-25`)",
+            message="What to remind you about",
+        )
+        async def rappel(interaction: discord.Interaction, date: str, message: str):
+            when = _parse_reminder_date(date)
+            if when is None:
+                await interaction.response.send_message(
+                    "❌ Couldn't parse that date. Try formats like:\n"
+                    "`2026-09-25 14:30` · `25/09/2026 14:30` · `2026-09-25` (defaults to 09:00 UTC)",
+                    ephemeral=True,
+                )
+                return
+
+            now = datetime.now(timezone.utc)
+            if when <= now:
+                await interaction.response.send_message(
+                    "❌ That date is in the past. Pick a future time.", ephemeral=True
+                )
+                return
+            if (when - now).days > REMINDER_MAX_DAYS_AHEAD:
+                await interaction.response.send_message(
+                    f"❌ Reminders can only be set up to {REMINDER_MAX_DAYS_AHEAD} days ahead.",
+                    ephemeral=True,
+                )
+                return
+
+            uid_str = str(interaction.user.id)
+            user_count = sum(1 for r in self.reminders if r.get("user_id") == uid_str)
+            if user_count >= MAX_REMINDERS_PER_USER:
+                await interaction.response.send_message(
+                    f"❌ You already have {MAX_REMINDERS_PER_USER} pending reminders. "
+                    "Cancel some with `/annuler_rappel` first.",
+                    ephemeral=True,
+                )
+                return
+
+            msg = message.strip()
+            if len(msg) > 500:
+                msg = msg[:500] + "…"
+
+            rid = uuid.uuid4().hex[:8]
+            entry = {
+                "id": rid,
+                "user_id": uid_str,
+                "username": str(interaction.user),
+                "message": msg,
+                "when": when.isoformat(timespec="seconds"),
+                "created_at": now.isoformat(timespec="seconds"),
+            }
+            self.reminders.append(entry)
+            save_reminders(self.reminders)
+
+            unix = int(when.timestamp())
+            await interaction.response.send_message(
+                f"⏰ Reminder set for <t:{unix}:F> (<t:{unix}:R>).\n"
+                f"**ID:** `{rid}` · **Message:** {msg}\n"
+                "_The bot will DM you at that time. Make sure your DMs are open._",
+                ephemeral=True,
+            )
+            log.info("Reminder %s set by %s for %s", rid, interaction.user, entry["when"])
+
+        # --------- /mes_rappels ---------
+
+        @self.tree.command(name="mes_rappels", description="List your pending reminders")
+        async def mes_rappels(interaction: discord.Interaction):
+            uid_str = str(interaction.user.id)
+            mine = [r for r in self.reminders if r.get("user_id") == uid_str]
+            if not mine:
+                await interaction.response.send_message(
+                    "You have no pending reminders.", ephemeral=True
+                )
+                return
+            mine.sort(key=lambda r: r.get("when", ""))
+            lines = []
+            for r in mine[:20]:
+                try:
+                    when = datetime.fromisoformat(r["when"])
+                    unix = int(when.timestamp())
+                    when_str = f"<t:{unix}:F> (<t:{unix}:R>)"
+                except Exception:
+                    when_str = r.get("when", "?")
+                msg = r.get("message", "")
+                if len(msg) > 80:
+                    msg = msg[:80] + "…"
+                lines.append(f"`{r['id']}` — {when_str} — {msg}")
+            header = f"⏰ **Your reminders** ({len(mine)})"
+            if len(mine) > 20:
+                header += " — showing first 20"
+            await interaction.response.send_message(header + "\n" + "\n".join(lines), ephemeral=True)
+
+        # --------- /annuler_rappel ---------
+
+        @self.tree.command(name="annuler_rappel", description="Cancel one of your reminders by ID")
+        @app_commands.describe(id="The reminder ID (see `/mes_rappels`)")
+        async def annuler_rappel(interaction: discord.Interaction, id: str):
+            uid_str = str(interaction.user.id)
+            rid = id.strip()
+            target = None
+            for r in self.reminders:
+                if r.get("id") == rid:
+                    target = r
+                    break
+            if target is None:
+                await interaction.response.send_message(
+                    f"No reminder with ID `{rid}`.", ephemeral=True
+                )
+                return
+            if target.get("user_id") != uid_str and not _is_admin(self, interaction.user):
+                await interaction.response.send_message(
+                    "❌ That reminder isn't yours.", ephemeral=True
+                )
+                return
+            self.reminders = [r for r in self.reminders if r.get("id") != rid]
+            save_reminders(self.reminders)
+            await interaction.response.send_message(f"✅ Reminder `{rid}` cancelled.", ephemeral=True)
+
+        # --------- /signaler ---------
+
+        @self.tree.command(name="signaler", description="Report a problem to the moderators")
+        @app_commands.describe(
+            message="What's the problem?",
+            anonymous="Hide your name from mods (default: no)",
+        )
+        async def signaler(interaction: discord.Interaction, message: str, anonymous: bool = False):
+            report_channel_id = (
+                _get_channel_id(self.config, "report_channel_id")
+                or _get_channel_id(self.config, "mod_channel_id")
+            )
+            if report_channel_id is None:
+                await interaction.response.send_message(
+                    "Reporting is not configured. Contact an admin.", ephemeral=True
+                )
+                return
+            channel = interaction.guild.get_channel(report_channel_id)
+            if channel is None:
+                await interaction.response.send_message(
+                    "Report channel not found. Contact an admin.", ephemeral=True
+                )
+                return
+
+            msg = message.strip()
+            if len(msg) > 1500:
+                msg = msg[:1500] + "…"
+
+            reporter = "anonymous" if anonymous else f"{interaction.user} (`{interaction.user.id}`)"
+            header = f"📨 **New report** from {reporter}"
+            if interaction.channel and isinstance(interaction.channel, discord.TextChannel):
+                header += f"\nChannel: {interaction.channel.mention}"
+
+            embed = discord.Embed(
+                title="Student report",
+                description=msg,
+                color=discord.Color.orange(),
+                timestamp=datetime.now(timezone.utc),
+            )
+            embed.set_footer(text=f"Guild: {interaction.guild.name}")
+
+            try:
+                await channel.send(content=header, embed=embed)
+            except discord.HTTPException as exc:
+                log.warning("Could not deliver report: %s", exc)
+                await interaction.response.send_message(
+                    "Could not deliver your report. Please contact a mod directly.", ephemeral=True
+                )
+                return
+
+            log.info("Report from %s: %s", interaction.user, msg[:100])
+            await interaction.response.send_message(
+                "✅ Your report has been sent to the moderators. Thank you.",
+                ephemeral=True,
+            )
+
+        # --------- /backup ---------
+
+        @self.tree.command(name="backup", description="Send data files to the mod channel (admin)")
+        async def backup(interaction: discord.Interaction):
+            if not _is_admin(self, interaction.user):
+                await interaction.response.send_message("You don't have permission to use this.", ephemeral=True)
+                return
+
+            await interaction.response.defer(ephemeral=True)
+
+            files = []
+            missing = []
+            for path, label in [
+                (VERIFIED_PATH, "verified.json"),
+                (VERIFY_LOG_PATH, "verify_log.csv"),
+                (CONFIG_PATH, "config.json"),
+                (REMINDERS_PATH, "reminders.json"),
+            ]:
+                if path.exists():
+                    try:
+                        files.append(discord.File(str(path), filename=label))
+                    except Exception as exc:
+                        missing.append(f"{label} ({exc})")
+                else:
+                    missing.append(label)
+
+            if not files:
+                await interaction.followup.send(
+                    "No files to back up: " + ", ".join(missing), ephemeral=True
+                )
+                return
+
+            mod_channel_id = _get_channel_id(self.config, "mod_channel_id")
+            channel = interaction.guild.get_channel(mod_channel_id) if mod_channel_id else None
+
+            if channel is None:
+                await interaction.followup.send(
+                    f"Mod channel not found — sending here instead.\n"
+                    + (f"Missing: {', '.join(missing)}" if missing else ""),
+                    files=files,
+                    ephemeral=True,
+                )
+            else:
+                try:
+                    await channel.send(
+                        content=f"💾 **Backup** requested by {interaction.user.mention}",
+                        files=files,
+                    )
+                    await interaction.followup.send(
+                        f"✅ Backup sent to {channel.mention}."
+                        + (f"\nMissing: {', '.join(missing)}" if missing else ""),
+                        ephemeral=True,
+                    )
+                except discord.HTTPException as exc:
+                    log.warning("Backup delivery failed: %s", exc)
+                    await interaction.followup.send(
+                        f"Could not deliver backup: {exc}", ephemeral=True
+                    )
+
+        # --------- /reload_config ---------
+
+        @self.tree.command(name="reload_config", description="Re-read config.json without restart (admin)")
+        async def reload_config(interaction: discord.Interaction):
+            if not _is_admin(self, interaction.user):
+                await interaction.response.send_message("You don't have permission to use this.", ephemeral=True)
+                return
+
+            try:
+                fresh = load_config_file()
+            except Exception as exc:
+                await interaction.response.send_message(
+                    f"❌ Failed to read config.json: {exc}", ephemeral=True
+                )
+                return
+
+            old_keys = set(self.config.keys())
+            new_keys = set(fresh.keys())
+            changed = []
+            added = sorted(new_keys - old_keys)
+            removed = sorted(old_keys - new_keys)
+            for k in sorted(new_keys & old_keys):
+                if self.config[k] != fresh[k]:
+                    changed.append(k)
+
+            self.config = fresh
+            log.info("Config reloaded: +%s -%s ~%s", added, removed, changed)
+
+            summary = ["🔄 **Config reloaded**"]
+            if added:
+                summary.append(f"➕ Added keys: `{', '.join(added)}`")
+            if removed:
+                summary.append(f"➖ Removed keys: `{', '.join(removed)}`")
+            if changed:
+                summary.append(f"✏️ Changed keys: `{', '.join(changed)}`")
+            if not (added or removed or changed):
+                summary.append("No changes detected.")
+
+            summary.append(
+                "\n*Note: `xlsx_file` and role names are re-read at next use. "
+                "Run `/refresh` to reload the student list, and re-run `/sync_groupes` if roles changed.*"
+            )
+
+            await interaction.response.send_message("\n".join(summary), ephemeral=True)
+
+        # --------- /timeout ---------
+
+        @self.tree.command(name="timeout", description="Apply a real Discord timeout to a member (admin)")
+        @app_commands.describe(
+            user="Member to time out",
+            minutes="Duration in minutes (1–10080)",
+            reason="Reason shown in the audit log",
+        )
+        async def timeout_cmd(interaction: discord.Interaction, user: discord.Member,
+                              minutes: int, reason: str = "Manual timeout"):
+            if not _is_admin(self, interaction.user):
+                await interaction.response.send_message("You don't have permission to use this.", ephemeral=True)
+                return
+            if minutes < 1 or minutes > 10080:
+                await interaction.response.send_message(
+                    "Minutes must be between 1 and 10080 (7 days).", ephemeral=True
+                )
+                return
+            try:
+                until = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+                await user.timeout(until, reason=f"{reason} (by {interaction.user})")
+            except discord.Forbidden:
+                await interaction.response.send_message(
+                    "❌ I can't time out that user — check my role hierarchy and "
+                    "the `Moderate Members` permission.", ephemeral=True
+                )
+                return
+            except discord.HTTPException as exc:
+                await interaction.response.send_message(f"❌ Timeout failed: {exc}", ephemeral=True)
+                return
+
+            await interaction.response.send_message(
+                f"🔇 Timed out {user.mention} for **{minutes} min**. Reason: {reason}",
+                ephemeral=False,
+            )
+
+        # --------- /untimeout ---------
+
+        @self.tree.command(name="untimeout", description="Remove a Discord timeout from a member (admin)")
+        @app_commands.describe(user="Member to release")
+        async def untimeout_cmd(interaction: discord.Interaction, user: discord.Member):
+            if not _is_admin(self, interaction.user):
+                await interaction.response.send_message("You don't have permission to use this.", ephemeral=True)
+                return
+            try:
+                await user.timeout(None, reason=f"Untimeout by {interaction.user}")
+            except discord.Forbidden:
+                await interaction.response.send_message(
+                    "❌ I can't modify that user's timeout.", ephemeral=True
+                )
+                return
+            except discord.HTTPException as exc:
+                await interaction.response.send_message(f"❌ Failed: {exc}", ephemeral=True)
+                return
+            await interaction.response.send_message(f"🔊 {user.mention} is free again.", ephemeral=True)
+
         # --------- /creer_roles_groupes ---------
 
         @self.tree.command(name="creer_roles_groupes", description="Create G1..Gn roles from the list (admin)")
@@ -703,10 +1195,7 @@ class VerifyBot(commands.Bot):
                 await interaction.followup.send("No TD groups found in the student list.", ephemeral=True)
                 return
 
-            created = []
-            already = []
-            failed = []
-
+            created, already, failed = [], [], []
             for g in groups:
                 name = fmt.format(group=g)
                 existing = discord.utils.get(interaction.guild.roles, name=name)
@@ -757,14 +1246,8 @@ class VerifyBot(commands.Bot):
                 return
 
             stats = {
-                "checked": 0,
-                "not_linked": 0,
-                "no_group": 0,
-                "role_missing": 0,
-                "assigned": 0,
-                "already_ok": 0,
-                "removed_stale": 0,
-                "errors": 0,
+                "checked": 0, "not_linked": 0, "no_group": 0, "role_missing": 0,
+                "assigned": 0, "already_ok": 0, "removed_stale": 0, "errors": 0,
             }
             details = []
 
@@ -930,6 +1413,7 @@ class VerifyBot(commands.Bot):
                 f"**Rows skipped in xlsx:** {self.skipped_rows}\n"
                 f"**Linked accounts (verified.json):** {len(self.verified)}\n"
                 f"**Verification log entries:** {log_entries}\n"
+                f"**Pending reminders:** {len(self.reminders)}\n"
                 f"**TD groups in list:** {', '.join(groups) if groups else 'none'}",
                 ephemeral=True,
             )
@@ -1021,7 +1505,6 @@ class VerifyBot(commands.Bot):
                 )
                 return
 
-            # clear the mapping + reverse index
             if str(user.id) in self.verified:
                 old_mat = self.verified[str(user.id)]
                 self.matricule_to_user.pop(old_mat, None)
@@ -1081,17 +1564,23 @@ class VerifyBot(commands.Bot):
             await interaction.response.send_message(
                 "**📖 Available commands**\n\n"
                 "**For students**\n"
-                "`/verify <matricule>` — Verify yourself as an SII student\n"
+                "`/verify <matricule>` — Verify yourself (only in the verify channel)\n"
                 "`/mes_infos` — Show your full student record\n"
                 "`/mes_groupes` — Show your TD and TP groups\n"
                 "`/mes_camarades` — List classmates in your TD group\n"
-                "`/groupe <n>` — List all students in TD group n\n"
                 "`/annuaire <matricule>` — Look up a classmate's groups\n"
+                "`/rappel <date> <message>` — Set a personal reminder (DM'd to you)\n"
+                "`/mes_rappels` — List your reminders\n"
+                "`/annuler_rappel <id>` — Cancel a reminder\n"
+                "`/signaler <message>` — Send a report to the mod team\n"
                 "`/info <topic>` — Planning, homework, rules\n"
                 "`/stats` — Bot statistics\n"
                 "`/help` — This message\n\n"
                 "**Admins only**\n"
-                "`/creer_roles_groupes` · `/sync_groupes` · `/verify_log` · `/check` · `/search` · `/refresh` · `/unverify` · `/export` · `/list_commands`",
+                "`/groupe <n>` — List ALL students in TD n\n"
+                "`/timeout <user> <min>` · `/untimeout <user>`\n"
+                "`/backup` · `/reload_config` · `/creer_roles_groupes` · `/sync_groupes` · `/verify_log`\n"
+                "`/check` · `/search` · `/refresh` · `/unverify` · `/export` · `/list_commands`",
                 ephemeral=True,
             )
 
@@ -1102,8 +1591,7 @@ def main():
     if not CONFIG_PATH.exists():
         log.error("config.json not found. Copy config.example.json to config.json and fill it in.")
         raise SystemExit(1)
-    with open(CONFIG_PATH) as f:
-        config = json.load(f)
+    config = load_config_file()
 
     token = os.environ.get("DISCORD_TOKEN") or config.get("discord_token")
     if not token:
