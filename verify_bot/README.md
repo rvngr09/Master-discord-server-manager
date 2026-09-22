@@ -1,8 +1,51 @@
-# SII Verify — Discord Bot
+# 🎓 SII Verify Bot
 
-A Discord bot that verifies whether a user is a real student of the **SII** speciality by looking up their matricule in the Excel student list.
+A Discord bot that checks people are **real M1 SII A students** using the official university list (the `.xlsx` file).
 
-## Setup
+- Sends you your student info
+- Gives you a **verified role** + your **TD group role**
+- Blocks anyone who isn't on the list
+
+---
+
+## 📌 For students — how to use it
+
+### 1) Verify yourself
+
+Go to the **#verify** channel and run:
+
+```
+/verify 222231378114
+```
+
+*(replace `222231378114` with your own matricule — it's on your student card / PC number)*
+
+| Result | What happens |
+| --- | --- |
+| ✅ You're on the list, SII + Admis | You get the **SII Verified** role + your TD group role (e.g. `G1`) |
+| ❌ Not on the list / not SII / not Admis | You get the **VISITOR** role and a message explaining why |
+
+> Only send your matricule (a number) in #verify. If you spam non-numbers, the bot will **time you out** for 5 minutes after 3 tries.
+
+### 2) Useful commands
+
+| Command | What it does |
+| --- | --- |
+| `/mes_infos` | Show your own student record |
+| `/mes_groupes` | Show your TD / TP groups |
+| `/mes_camarades` | List everyone in your TD group |
+| `/annuaire <matricule>` | Look up a classmate's groups |
+| `/rappel <date> <message>` | Set a reminder → gets DM'd to you (e.g. `/rappel 25/09/2026 14:30 Devoir de maths`) |
+| `/mes_rappels` | List your pending reminders |
+| `/annuler_rappel <id>` | Cancel a reminder |
+| `/signaler <message>` | Report a problem to the moderators |
+| `/info <topic>` | Class info: `planning`, `devoirs`, `reglement` |
+| `/stats` | Bot stats |
+| `/help` | Show all commands |
+
+---
+
+## 🛠️ For whoever runs the bot
 
 ```bash
 cd verify_bot
@@ -11,47 +54,28 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Create your config:
+1. Copy `config.example.json` → `config.json`
+2. Fill in your **bot token**, guild ID, role names and channel IDs
+3. Create the roles **SII Verified**, **VISITOR**, and `G1`...`G3` in your server
+4. ### ⚠️ Never share `config.json` — it contains your secret bot token
 
 ```bash
-cp config.example.json config.json
-# edit config.json
-```
-
-Fill in `config.json`:
-
-| Key | Description |
-| --- | --- |
-| `discord_token` | Your bot token (from the Discord Developer Portal). Alternatively set the `DISCORD_TOKEN` env var. |
-| `sync_guild_id` | Server ID to register commands in instantly (recommended while testing). |
-| `admin_user_ids` | Your Discord user ID(s) — allow `/refresh`. |
-| `admin_role` | Optional role name allowed to use `/refresh`. |
-| `verified_role` | Role granted to confirmed SII students (create it in your server, this name must match). |
-| `unverified_role` | Role granted to people who are NOT on the list or not ADM. |
-| `mod_channel_id` | Channel where failed verification attempts are reported. |
-| `xlsx_file` | Path to the Excel list (from the bot's folder). |
-
-## Run
-
-```bash
-source .venv/bin/activate
 python bot.py
 ```
 
-## Commands
+The bot sends a 🟢 *online* message and a log of every verification to your **mod channel**.
 
-| Command | Description |
+### Admin commands
+
+`/creer_roles_groupes` · `/sync_groupes` · `/groupe <n>` · `/check` · `/search` · `/verify_log` · `/export` · `/backup` · `/reload_config` · `/timeout` · `/untimeout` · `/unverify` · `/refresh`
+
+---
+
+## 📁 Files
+
+| File | Purpose |
 | --- | --- |
-| `/verify <matricule>` | Checks the matricule. If found in the list with speciality **SII** and status **ADM**, replies + assigns the verified role. Otherwise it replies with the reason and assigns the unverified role. |
-| `/check <matricule>` | Private lookup of any matricule (useful for moderators). |
-| `/refresh` | Reloads students from the xlsx file (admin only). |
-
-## How verification works
-
-A student passes when ALL of these are true:
-
-1. The matricule exists in the list.
-2. `Spécialité` == **SII** (note: one row in the file is `SSI` and will be rejected).
-3. `Etat` == **ADM** (TRFU, AJR and RNTG rows are rejected).
-
-Anything else → unverified role + a message sent to the mod channel.
+| `M1 SII A (Liste Affichage).xlsx` | The official student list the bot checks against |
+| `verify_bot/verified.json` | Which Discord user is linked to which matricule |
+| `verify_bot/verify_log.csv` | Log of every verification attempt |
+| `verify_bot/reminders.json` | Everyone's pending reminders |
